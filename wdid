@@ -53,6 +53,8 @@ def extract_user_text(content):
         return None
     if stripped.startswith("<system-reminder>"):
         return None
+    if stripped.startswith("<local-command-stdout>"):
+        return None
     # Slash-command wrappers: pull out just the command name (e.g. /commit).
     if stripped.startswith("<command-"):
         start = stripped.find("<command-name>")
@@ -62,6 +64,51 @@ def extract_user_text(content):
                 return stripped[start + len("<command-name>"):end].strip()
         return None
     return stripped
+
+
+def summarize_assistant_message(msg):
+    """Extract a compact narrative line from an assistant message.
+
+    Returns a dict with optional keys: `text` (assistant prose) and `actions`
+    (list of short strings describing tool calls — file paths for edits,
+    truncated commands for shell calls, etc.). Used as input to Haiku so the
+    summary reflects what Claude actually *did*, not just what was asked.
+    """
+    out = {"text": "", "actions": []}
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return out
+    text_parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text_parts.append(block.get("text", ""))
+        elif btype == "tool_use":
+            name = block.get("name", "?")
+            inp = block.get("input") or {}
+            label = name
+            if name in ("Write", "Edit", "Read", "NotebookEdit"):
+                fp = inp.get("file_path") or inp.get("notebook_path") or ""
+                if fp:
+                    label = f"{name} {Path(fp).name}"
+            elif name == "Bash":
+                cmd = (inp.get("command") or "").splitlines()[0]
+                if cmd:
+                    label = f"$ {cmd[:80]}"
+            elif name in ("Grep", "Glob"):
+                pat = inp.get("pattern") or inp.get("query") or ""
+                if pat:
+                    label = f"{name} {pat[:60]}"
+            elif name == "Agent":
+                desc = inp.get("description") or ""
+                if desc:
+                    label = f"Agent: {desc[:60]}"
+            out["actions"].append(label)
+    if text_parts:
+        out["text"] = "\n".join(t for t in text_parts if t).strip()
+    return out
 
 
 def collect_events(jsonl_path):
@@ -114,7 +161,8 @@ def collect_events(jsonl_path):
                 pending_titles.clear()
 
                 if etype == "assistant":
-                    yield (ts, "assistant", None, cwd)
+                    detail = summarize_assistant_message(e.get("message") or {})
+                    yield (ts, "assistant", detail, cwd)
                     continue
 
                 if etype != "user":
@@ -195,6 +243,8 @@ def session_summary(events_list, log_path):
               if kind == "title" and text]
     user_texts = [text for _ts, kind, text, _cwd in events_list
                   if kind == "user" and text]
+    assistant_details = [text for _ts, kind, text, _cwd in events_list
+                         if kind == "assistant" and isinstance(text, dict)]
     fallback = next((t for t in user_texts if not t.startswith("/")), "")
     if not fallback:
         fallback = user_texts[0] if user_texts else ""
@@ -208,6 +258,7 @@ def session_summary(events_list, log_path):
         "ai_title": titles[-1] if titles else "",
         "fallback_name": fallback,
         "user_texts": user_texts,
+        "assistant_details": assistant_details,
         "event_count": len(real_events),
         "cwd": cwd,
     }
@@ -251,28 +302,65 @@ def save_cache(date, data):
     tmp.replace(p)
 
 
-def haiku_title(api_key, user_texts):
+def build_session_narrative(user_texts, assistant_details, budget=12000):
+    """Compose a transcript-like blob for Haiku covering both intent and
+    outcome: user prompts, assistant prose (last replies prioritized), and
+    file/command actions Claude actually performed."""
+    raw_prompts = [t for t in user_texts if not t.startswith("/")] or user_texts
+    # Cap each prompt so one giant paste can't squeeze actions/replies out.
+    prompts = [(p if len(p) <= 1500 else p[:1499] + "…") for p in raw_prompts]
+    actions = []
+    for d in assistant_details:
+        actions.extend(d.get("actions", []))
+    # Deduplicate actions while preserving order, capped to keep things tight.
+    seen = set()
+    actions_unique = []
+    for a in actions:
+        if a in seen:
+            continue
+        seen.add(a)
+        actions_unique.append(a)
+        if len(actions_unique) >= 50:
+            break
+
+    # Take the last 4 substantive assistant replies — they usually summarise
+    # what was done, not what was planned at the start.
+    replies = [d["text"] for d in assistant_details if d.get("text")]
+    tail_replies = [r[:800] for r in replies[-4:]]
+
+    parts = []
+    if prompts:
+        parts.append("USER PROMPTS:\n" + "\n---\n".join(prompts))
+    if actions_unique:
+        parts.append("ACTIONS TAKEN:\n" + "\n".join(actions_unique))
+    if tail_replies:
+        parts.append("FINAL ASSISTANT MESSAGES:\n" + "\n---\n".join(tail_replies))
+    blob = "\n\n".join(parts)
+    return blob[:budget]
+
+
+def haiku_title(api_key, user_texts, assistant_details):
     """Ask Haiku for a concise session title. Returns string or None."""
-    prompts = [t for t in user_texts if not t.startswith("/")] or user_texts
-    if not prompts:
+    blob = build_session_narrative(user_texts, assistant_details)
+    if not blob:
         return None
-    blob = "\n\n---\n\n".join(prompts)[:8000]
     body = json.dumps({
         "model": HAIKU_MODEL,
         "max_tokens": 40,
         "system": (
             "You write concise session titles for a developer's coding logs. "
-            "Given the user prompts from one Claude Code session, output a "
-            "single 5-10 word title in sentence case that captures what was "
-            "worked on. Output the title only — no quotes, no preamble, no "
-            "trailing punctuation, no markdown, never copy text from the "
+            "You'll receive user prompts, a list of actions the assistant "
+            "took (file edits, shell commands), and the assistant's final "
+            "replies. Weigh the actions and final replies as much as the "
+            "prompts so the title reflects what was actually done, not just "
+            "what was initially planned. Output a single 5-10 word title in "
+            "sentence case. Output the title only — no quotes, no preamble, "
+            "no trailing punctuation, no markdown, never copy text from the "
             "input verbatim. Never refuse, apologize, or ask for more "
-            "context: with limited input, infer a best-effort title from "
-            "what's there."
+            "context: with limited input, infer a best-effort title."
         ),
         "messages": [
-            {"role": "user",
-             "content": f"User prompts from the session:\n\n{blob}"},
+            {"role": "user", "content": blob},
         ],
     }).encode()
     req = urllib.request.Request(
@@ -385,7 +473,8 @@ def main():
             continue
 
         if summarize:
-            title = haiku_title(api_key, s["user_texts"])
+            title = haiku_title(api_key, s["user_texts"],
+                                s["assistant_details"])
             if title:
                 cache.setdefault(s["log_path"], {})[start_iso] = {
                     "title": title,
