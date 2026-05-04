@@ -6,6 +6,8 @@ import json
 import os
 import shutil
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,6 +18,10 @@ IDLE_SPLIT = timedelta(minutes=30)
 # we have no close signal in the logs, so we credit the same ~3 min of idle
 # time that triggers Claude's `away_summary`.
 TRAILING_READ = timedelta(minutes=3)
+
+CACHE_DIR = Path.home() / ".cache" / "wdid"
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
 
 
 def parse_ts(s):
@@ -59,7 +65,15 @@ def extract_user_text(content):
 
 
 def collect_events(jsonl_path):
-    """Yield (timestamp, kind, text, cwd) tuples for relevant events."""
+    """Yield (timestamp, kind, text, cwd) tuples for relevant events.
+
+    `kind` is one of: "user", "assistant", "title".
+    "title" carries an `ai-title` value, anchored to the nearest preceding
+    timestamped event so it lands inside the right engagement session.
+    """
+    last_ts = None
+    last_cwd = ""
+    pending_titles = []  # ai-titles seen before any timestamped event
     try:
         with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -72,8 +86,19 @@ def collect_events(jsonl_path):
                     continue
 
                 etype = e.get("type")
+
+                if etype == "ai-title":
+                    title = (e.get("aiTitle") or "").strip()
+                    if not title:
+                        continue
+                    if last_ts is None:
+                        pending_titles.append(title)
+                    else:
+                        yield (last_ts, "title", title, last_cwd)
+                    continue
+
                 ts_raw = e.get("timestamp")
-                if not ts_raw or etype not in ("user", "assistant"):
+                if not ts_raw:
                     continue
                 try:
                     ts = parse_ts(ts_raw)
@@ -81,12 +106,20 @@ def collect_events(jsonl_path):
                     continue
 
                 cwd = e.get("cwd", "")
+                last_ts = ts
+                if cwd:
+                    last_cwd = cwd
+                for title in pending_titles:
+                    yield (ts, "title", title, cwd)
+                pending_titles.clear()
 
                 if etype == "assistant":
                     yield (ts, "assistant", None, cwd)
                     continue
 
-                # user
+                if etype != "user":
+                    continue
+
                 if e.get("isMeta"):
                     continue
                 msg = e.get("message") or {}
@@ -105,6 +138,10 @@ def find_session_logs(now):
         return []
     logs = []
     for root, _dirs, files in os.walk(PROJECTS_DIR):
+        # Subagent runs live under .../subagents/ and are part of their parent
+        # session timewise — including them double-counts engagement.
+        if "subagents" in Path(root).parts:
+            continue
         for name in files:
             if not name.endswith(".jsonl"):
                 continue
@@ -118,36 +155,62 @@ def find_session_logs(now):
 
 
 def split_into_sessions(events):
-    """Split chronological events into engagement sessions on idle > 30 min."""
+    """Split chronological events into engagement sessions on idle > 30 min.
+
+    Splitting and gap timing are driven by user/assistant events only; title
+    markers ride along inside whatever session contains their timestamp.
+    """
     if not events:
         return []
     sessions = [[events[0]]]
-    for prev, cur in zip(events, events[1:]):
-        if cur[0] - prev[0] > IDLE_SPLIT:
+    last_real = events[0][0] if events[0][1] != "title" else None
+    for cur in events[1:]:
+        ts, kind, *_ = cur
+        if kind == "title":
+            sessions[-1].append(cur)
+            continue
+        if last_real is not None and ts - last_real > IDLE_SPLIT:
             sessions.append([cur])
         else:
             sessions[-1].append(cur)
+        last_real = ts
     return sessions
 
 
-def session_summary(events_list):
-    start = events_list[0][0]
-    end = events_list[-1][0]
+def session_summary(events_list, log_path):
+    real_events = [e for e in events_list if e[1] != "title"]
+    if not real_events:
+        return None
+    start = real_events[0][0]
+    end = real_events[-1][0]
     engagement = timedelta(0)
-    for prev, cur in zip(events_list, events_list[1:]):
+    for prev, cur in zip(real_events, real_events[1:]):
         gap = cur[0] - prev[0]
         if gap <= IDLE_SPLIT:
             engagement += gap
-    if events_list[-1][1] == "assistant":
+    if real_events[-1][1] == "assistant":
         engagement += TRAILING_READ
+
+    titles = [text for _ts, kind, text, _cwd in events_list
+              if kind == "title" and text]
     user_texts = [text for _ts, kind, text, _cwd in events_list
                   if kind == "user" and text]
-    # Prefer the first real prompt over slash commands like /clear, /commit.
-    name = next((t for t in user_texts if not t.startswith("/")), "")
-    if not name:
-        name = user_texts[0] if user_texts else ""
+    fallback = next((t for t in user_texts if not t.startswith("/")), "")
+    if not fallback:
+        fallback = user_texts[0] if user_texts else ""
     cwd = next((c for _ts, _k, _t, c in events_list if c), "")
-    return start, end, engagement, name, cwd
+
+    return {
+        "log_path": str(log_path),
+        "start": start,
+        "end": end,
+        "engagement": engagement,
+        "ai_title": titles[-1] if titles else "",
+        "fallback_name": fallback,
+        "user_texts": user_texts,
+        "event_count": len(real_events),
+        "cwd": cwd,
+    }
 
 
 def fmt_hhmm(td):
@@ -166,6 +229,80 @@ def project_name(cwd):
     return Path(cwd).name if cwd else ""
 
 
+def cache_path_for(date):
+    return CACHE_DIR / f"titles-{date.isoformat()}.json"
+
+
+def load_cache(date):
+    p = cache_path_for(date)
+    if not p.is_file():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_cache(date, data):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    p = cache_path_for(date)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+    tmp.replace(p)
+
+
+def haiku_title(api_key, user_texts):
+    """Ask Haiku for a concise session title. Returns string or None."""
+    prompts = [t for t in user_texts if not t.startswith("/")] or user_texts
+    if not prompts:
+        return None
+    blob = "\n\n---\n\n".join(prompts)[:8000]
+    body = json.dumps({
+        "model": HAIKU_MODEL,
+        "max_tokens": 40,
+        "system": (
+            "You write concise session titles for a developer's coding logs. "
+            "Given the user prompts from one Claude Code session, output a "
+            "single 5-10 word title in sentence case that captures what was "
+            "worked on. Output the title only — no quotes, no preamble, no "
+            "trailing punctuation, no markdown, never copy text from the "
+            "input verbatim. Never refuse, apologize, or ask for more "
+            "context: with limited input, infer a best-effort title from "
+            "what's there."
+        ),
+        "messages": [
+            {"role": "user",
+             "content": f"User prompts from the session:\n\n{blob}"},
+        ],
+    }).encode()
+    req = urllib.request.Request(
+        ANTHROPIC_API,
+        data=body,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read())
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            json.JSONDecodeError) as exc:
+        print(f"wdid: haiku call failed: {exc}", file=sys.stderr)
+        return None
+    for block in payload.get("content", []):
+        if block.get("type") == "text":
+            text = block.get("text", "").strip().strip('"').rstrip(".")
+            # First line only — guard against models that ignore the
+            # "no preamble / no markdown" instruction.
+            text = text.splitlines()[0].strip() if text else ""
+            if len(text) > 120:
+                text = text[:119] + "…"
+            return text or None
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Show what you did on a given day, based on Claude Code session logs."
@@ -179,6 +316,11 @@ def main():
         "--all",
         action="store_true",
         help="Show all sessions found within the scan window, not just one day.",
+    )
+    ap.add_argument(
+        "--no-summarize",
+        action="store_true",
+        help="Skip Haiku-based summarization for sessions that lack an ai-title.",
     )
     args = ap.parse_args()
 
@@ -201,24 +343,66 @@ def main():
     for log in logs:
         events = sorted(collect_events(log), key=lambda e: e[0])
         for grp in split_into_sessions(events):
-            all_sessions.append(session_summary(grp))
+            summary = session_summary(grp, log)
+            if summary is not None:
+                all_sessions.append(summary)
 
     local_tz = now.tzinfo
     if not args.all:
         all_sessions = [
             s for s in all_sessions
-            if s[0].astimezone(local_tz).date() == target
+            if s["start"].astimezone(local_tz).date() == target
         ]
 
-    all_sessions.sort(key=lambda s: s[0])
+    all_sessions.sort(key=lambda s: s["start"])
 
     if not all_sessions:
         label = "any day" if args.all else target.isoformat()
         print(f"no sessions found for {label}")
         return 0
 
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    summarize = bool(api_key) and not args.no_summarize
+    caches = {}  # local-date -> cache dict
+    dirty = set()
+
+    def cache_for(date):
+        if date not in caches:
+            caches[date] = load_cache(date)
+        return caches[date]
+
+    for s in all_sessions:
+        date = s["start"].astimezone(local_tz).date()
+        cache = cache_for(date)
+        file_entries = cache.get(s["log_path"], {})
+        start_iso = s["start"].isoformat()
+        end_iso = s["end"].isoformat()
+        cached = file_entries.get(start_iso)
+        if (cached
+                and cached.get("end_ts") == end_iso
+                and cached.get("event_count") == s["event_count"]):
+            s["name"] = cached["title"]
+            continue
+
+        if summarize:
+            title = haiku_title(api_key, s["user_texts"])
+            if title:
+                cache.setdefault(s["log_path"], {})[start_iso] = {
+                    "title": title,
+                    "end_ts": end_iso,
+                    "event_count": s["event_count"],
+                }
+                dirty.add(date)
+                s["name"] = title
+                continue
+
+        s["name"] = s["ai_title"] or s["fallback_name"]
+
+    for date in dirty:
+        save_cache(date, caches[date])
+
     proj_w = max(
-        (len(project_name(s[4])) for s in all_sessions),
+        (len(project_name(s["cwd"])) for s in all_sessions),
         default=len("PROJECT"),
     )
     proj_w = max(proj_w, len("PROJECT"))
@@ -233,16 +417,17 @@ def main():
     print(header)
     print(rule)
     total = timedelta(0)
-    for start, end, eng, name, cwd in all_sessions:
-        s_local = start.astimezone(local_tz)
-        e_local = end.astimezone(local_tz)
+    for s in all_sessions:
+        s_local = s["start"].astimezone(local_tz)
+        e_local = s["end"].astimezone(local_tz)
         start_str = s_local.strftime("%Y-%m-%d %H:%M")
         end_str = e_local.strftime("%H:%M")
         print(
-            f"{start_str:16}  {end_str:5}  {fmt_hhmm(eng):>6}  "
-            f"{project_name(cwd):{proj_w}}  {fmt_name(name, name_w)}"
+            f"{start_str:16}  {end_str:5}  {fmt_hhmm(s['engagement']):>6}  "
+            f"{project_name(s['cwd']):{proj_w}}  "
+            f"{fmt_name(s['name'], name_w)}"
         )
-        total += eng
+        total += s["engagement"]
 
     print(rule)
     pad = 16 + 2 + 5 + 2
