@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Show Claude Code activity for a given day, derived from session logs."""
+
+import argparse
+import json
+import os
+import shutil
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+SCAN_WINDOW_DAYS = 5
+IDLE_SPLIT = timedelta(minutes=30)
+# Reading buffer added when a session's last event is an assistant message:
+# we have no close signal in the logs, so we credit the same ~3 min of idle
+# time that triggers Claude's `away_summary`.
+TRAILING_READ = timedelta(minutes=3)
+
+
+def parse_ts(s):
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+
+def extract_user_text(content):
+    """Return prompt text if this user entry is a real user command, else None."""
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "tool_result":
+                    return None
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+        text = "\n".join(parts)
+    else:
+        return None
+
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if stripped.startswith("<local-command-caveat>"):
+        return None
+    if stripped.startswith("<system-reminder>"):
+        return None
+    # Slash-command wrappers: pull out just the command name (e.g. /commit).
+    if stripped.startswith("<command-"):
+        start = stripped.find("<command-name>")
+        if start != -1:
+            end = stripped.find("</command-name>", start)
+            if end != -1:
+                return stripped[start + len("<command-name>"):end].strip()
+        return None
+    return stripped
+
+
+def collect_events(jsonl_path):
+    """Yield (timestamp, kind, text, cwd) tuples for relevant events."""
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                etype = e.get("type")
+                ts_raw = e.get("timestamp")
+                if not ts_raw or etype not in ("user", "assistant"):
+                    continue
+                try:
+                    ts = parse_ts(ts_raw)
+                except ValueError:
+                    continue
+
+                cwd = e.get("cwd", "")
+
+                if etype == "assistant":
+                    yield (ts, "assistant", None, cwd)
+                    continue
+
+                # user
+                if e.get("isMeta"):
+                    continue
+                msg = e.get("message") or {}
+                text = extract_user_text(msg.get("content"))
+                if text is None:
+                    continue
+                yield (ts, "user", text, cwd)
+    except (OSError, IOError):
+        return
+
+
+def find_session_logs(now):
+    cutoff = now - timedelta(days=SCAN_WINDOW_DAYS)
+    cutoff_ts = cutoff.timestamp()
+    if not PROJECTS_DIR.is_dir():
+        return []
+    logs = []
+    for root, _dirs, files in os.walk(PROJECTS_DIR):
+        for name in files:
+            if not name.endswith(".jsonl"):
+                continue
+            p = Path(root) / name
+            try:
+                if p.stat().st_mtime >= cutoff_ts:
+                    logs.append(p)
+            except OSError:
+                pass
+    return logs
+
+
+def split_into_sessions(events):
+    """Split chronological events into engagement sessions on idle > 30 min."""
+    if not events:
+        return []
+    sessions = [[events[0]]]
+    for prev, cur in zip(events, events[1:]):
+        if cur[0] - prev[0] > IDLE_SPLIT:
+            sessions.append([cur])
+        else:
+            sessions[-1].append(cur)
+    return sessions
+
+
+def session_summary(events_list):
+    start = events_list[0][0]
+    end = events_list[-1][0]
+    engagement = timedelta(0)
+    for prev, cur in zip(events_list, events_list[1:]):
+        gap = cur[0] - prev[0]
+        if gap <= IDLE_SPLIT:
+            engagement += gap
+    if events_list[-1][1] == "assistant":
+        engagement += TRAILING_READ
+    user_texts = [text for _ts, kind, text, _cwd in events_list
+                  if kind == "user" and text]
+    # Prefer the first real prompt over slash commands like /clear, /commit.
+    name = next((t for t in user_texts if not t.startswith("/")), "")
+    if not name:
+        name = user_texts[0] if user_texts else ""
+    cwd = next((c for _ts, _k, _t, c in events_list if c), "")
+    return start, end, engagement, name, cwd
+
+
+def fmt_hhmm(td):
+    total_min = int(td.total_seconds() // 60)
+    return f"{total_min // 60:02d}:{total_min % 60:02d}"
+
+
+def fmt_name(name, max_len):
+    name = " ".join(name.split())  # collapse whitespace
+    if max_len > 0 and len(name) > max_len:
+        name = name[: max_len - 1] + "…"
+    return name
+
+
+def project_name(cwd):
+    return Path(cwd).name if cwd else ""
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Show what you did on a given day, based on Claude Code session logs."
+    )
+    ap.add_argument(
+        "date",
+        nargs="?",
+        help="Date in YYYY-MM-DD (default: today). Also accepts 'yesterday'.",
+    )
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        help="Show all sessions found within the scan window, not just one day.",
+    )
+    args = ap.parse_args()
+
+    now = datetime.now().astimezone()
+    if args.date is None:
+        target = now.date()
+    elif args.date == "yesterday":
+        target = (now - timedelta(days=1)).date()
+    elif args.date == "today":
+        target = now.date()
+    else:
+        try:
+            target = datetime.strptime(args.date, "%Y-%m-%d").date()
+        except ValueError:
+            print(f"invalid date: {args.date!r} (expected YYYY-MM-DD)", file=sys.stderr)
+            return 2
+
+    logs = find_session_logs(now)
+    all_sessions = []
+    for log in logs:
+        events = sorted(collect_events(log), key=lambda e: e[0])
+        for grp in split_into_sessions(events):
+            all_sessions.append(session_summary(grp))
+
+    local_tz = now.tzinfo
+    if not args.all:
+        all_sessions = [
+            s for s in all_sessions
+            if s[0].astimezone(local_tz).date() == target
+        ]
+
+    all_sessions.sort(key=lambda s: s[0])
+
+    if not all_sessions:
+        label = "any day" if args.all else target.isoformat()
+        print(f"no sessions found for {label}")
+        return 0
+
+    proj_w = max(
+        (len(project_name(s[4])) for s in all_sessions),
+        default=len("PROJECT"),
+    )
+    proj_w = max(proj_w, len("PROJECT"))
+    fixed_w = 16 + 2 + 5 + 2 + 6 + 2 + proj_w + 2  # everything before NAME
+    term_w = shutil.get_terminal_size((100, 24)).columns
+    name_w = max(20, term_w - fixed_w)
+    header = (
+        f"{'START':16}  {'END':5}  {'ENG':>6}  "
+        f"{'PROJECT':{proj_w}}  NAME"
+    )
+    rule = "-" * (fixed_w + name_w)
+    print(header)
+    print(rule)
+    total = timedelta(0)
+    for start, end, eng, name, cwd in all_sessions:
+        s_local = start.astimezone(local_tz)
+        e_local = end.astimezone(local_tz)
+        start_str = s_local.strftime("%Y-%m-%d %H:%M")
+        end_str = e_local.strftime("%H:%M")
+        print(
+            f"{start_str:16}  {end_str:5}  {fmt_hhmm(eng):>6}  "
+            f"{project_name(cwd):{proj_w}}  {fmt_name(name, name_w)}"
+        )
+        total += eng
+
+    print(rule)
+    pad = 16 + 2 + 5 + 2
+    print(f"{'total':>{pad}}  {fmt_hhmm(total):>6}  ({len(all_sessions)} sessions)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
