@@ -179,8 +179,11 @@ def collect_events(jsonl_path):
         return
 
 
-def find_session_logs(now):
-    cutoff = now - timedelta(days=SCAN_WINDOW_DAYS)
+def find_session_logs(reference):
+    """Return session log paths whose mtime is within SCAN_WINDOW_DAYS before
+    `reference`. Files modified after `reference` are also kept — they may
+    contain target-date events that were appended by a later `--resume`."""
+    cutoff = reference - timedelta(days=SCAN_WINDOW_DAYS)
     cutoff_ts = cutoff.timestamp()
     if not PROJECTS_DIR.is_dir():
         return []
@@ -426,7 +429,15 @@ def main():
             print(f"invalid date: {args.date!r} (expected YYYY-MM-DD)", file=sys.stderr)
             return 2
 
-    logs = find_session_logs(now)
+    # End of the target day in local time — the reference point for the
+    # scan window. For --all, fall back to "now" so we look at recent files.
+    if args.all:
+        reference = now
+    else:
+        reference = datetime.combine(
+            target + timedelta(days=1), datetime.min.time()
+        ).replace(tzinfo=now.tzinfo)
+    logs = find_session_logs(reference)
     all_sessions = []
     for log in logs:
         events = sorted(collect_events(log), key=lambda e: e[0])
