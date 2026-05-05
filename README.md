@@ -9,7 +9,6 @@ from the JSONL session logs under `~/.claude/projects/`.
 ./wdid                  # today
 ./wdid yesterday
 ./wdid 2026-04-30
-./wdid --all            # everything in the last 5 days
 ./wdid --no-summarize   # skip Haiku-based titles
 ```
 

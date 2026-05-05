@@ -404,11 +404,6 @@ def main():
         help="Date in YYYY-MM-DD (default: today). Also accepts 'yesterday'.",
     )
     ap.add_argument(
-        "--all",
-        action="store_true",
-        help="Show all sessions found within the scan window, not just one day.",
-    )
-    ap.add_argument(
         "--no-summarize",
         action="store_true",
         help="Skip Haiku-based summarization for sessions that lack an ai-title.",
@@ -416,12 +411,11 @@ def main():
     args = ap.parse_args()
 
     now = datetime.now().astimezone()
-    if args.date is None:
+    local_tz = now.tzinfo
+    if args.date is None or args.date == "today":
         target = now.date()
     elif args.date == "yesterday":
         target = (now - timedelta(days=1)).date()
-    elif args.date == "today":
-        target = now.date()
     else:
         try:
             target = datetime.strptime(args.date, "%Y-%m-%d").date()
@@ -429,50 +423,33 @@ def main():
             print(f"invalid date: {args.date!r} (expected YYYY-MM-DD)", file=sys.stderr)
             return 2
 
-    # End of the target day in local time — the reference point for the
-    # scan window. For --all, fall back to "now" so we look at recent files.
-    if args.all:
-        reference = now
-    else:
-        reference = datetime.combine(
-            target + timedelta(days=1), datetime.min.time()
-        ).replace(tzinfo=now.tzinfo)
+    # Reference for the scan window: end of the target day in local time.
+    reference = datetime.combine(
+        target + timedelta(days=1), datetime.min.time()
+    ).replace(tzinfo=local_tz)
     logs = find_session_logs(reference)
     all_sessions = []
     for log in logs:
         events = sorted(collect_events(log), key=lambda e: e[0])
         for grp in split_into_sessions(events):
             summary = session_summary(grp, log)
-            if summary is not None:
+            if summary is None:
+                continue
+            if summary["start"].astimezone(local_tz).date() == target:
                 all_sessions.append(summary)
-
-    local_tz = now.tzinfo
-    if not args.all:
-        all_sessions = [
-            s for s in all_sessions
-            if s["start"].astimezone(local_tz).date() == target
-        ]
 
     all_sessions.sort(key=lambda s: s["start"])
 
     if not all_sessions:
-        label = "any day" if args.all else target.isoformat()
-        print(f"no sessions found for {label}")
+        print(f"no sessions found for {target.isoformat()}")
         return 0
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     summarize = bool(api_key) and not args.no_summarize
-    caches = {}  # local-date -> cache dict
-    dirty = set()
-
-    def cache_for(date):
-        if date not in caches:
-            caches[date] = load_cache(date)
-        return caches[date]
+    cache = load_cache(target)
+    dirty = False
 
     for s in all_sessions:
-        date = s["start"].astimezone(local_tz).date()
-        cache = cache_for(date)
         file_entries = cache.get(s["log_path"], {})
         start_iso = s["start"].isoformat()
         end_iso = s["end"].isoformat()
@@ -492,14 +469,14 @@ def main():
                     "end_ts": end_iso,
                     "event_count": s["event_count"],
                 }
-                dirty.add(date)
+                dirty = True
                 s["name"] = title
                 continue
 
         s["name"] = s["ai_title"] or s["fallback_name"]
 
-    for date in dirty:
-        save_cache(date, caches[date])
+    if dirty:
+        save_cache(target, cache)
 
     proj_w = max(
         (len(project_name(s["cwd"])) for s in all_sessions),
