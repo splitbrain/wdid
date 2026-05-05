@@ -483,12 +483,12 @@ def main():
         default=len("PROJECT"),
     )
     proj_w = max(proj_w, len("PROJECT"))
-    fixed_w = 16 + 2 + 5 + 2 + 6 + 2 + proj_w + 2  # everything before NAME
+    fixed_w = 5 + 2 + 5 + 2 + 5 + 2 + proj_w + 2  # everything before NAME
     term_w = shutil.get_terminal_size((100, 24)).columns
     name_w = max(20, term_w - fixed_w)
     header = (
-        f"{'START':16}  {'END':5}  {'ENG':>6}  "
-        f"{'PROJECT':{proj_w}}  NAME"
+        f"{'START':5}  {'END':5}  {'DUR':5}  "
+        f"{'PROJECT':{proj_w}}  DESC"
     )
     rule = "-" * (fixed_w + name_w)
     print(header)
@@ -497,18 +497,18 @@ def main():
     for s in all_sessions:
         s_local = s["start"].astimezone(local_tz)
         e_local = s["end"].astimezone(local_tz)
-        start_str = s_local.strftime("%Y-%m-%d %H:%M")
+        start_str = s_local.strftime("%H:%M")
         end_str = e_local.strftime("%H:%M")
         print(
-            f"{start_str:16}  {end_str:5}  {fmt_hhmm(s['engagement']):>6}  "
+            f"{start_str:5}  {end_str:5}  {fmt_hhmm(s['engagement']):5}  "
             f"{project_name(s['cwd']):{proj_w}}  "
             f"{fmt_name(s['name'], name_w)}"
         )
         total += s["engagement"]
 
     print(rule)
-    pad = 16 + 2 + 5 + 2
-    print(f"{'total':>{pad}}  {fmt_hhmm(total):>6}  ({len(all_sessions)} sessions)")
+    pad = 5 + 2 + 5
+    print(f"{'total':>{pad}}  {fmt_hhmm(total):5}  ({len(all_sessions)} sessions)")
     return 0
 
 

@@ -9,17 +9,19 @@ from the JSONL session logs under `~/.claude/projects/`.
 ./wdid                  # today
 ./wdid yesterday
 ./wdid 2026-04-30
-./wdid --no-summarize   # skip Haiku-based titles
+./wdid --no-summarize   # skip Haiku-based descriptions
 ```
 
 Output:
 
 ```
-START             END       ENG  PROJECT   NAME
-2026-04-30 13:59  15:14   01:17  dokuwiki  Replace horizontal rule with GfmHr implementation
-2026-04-30 15:15  15:35   00:23  dokuwiki  Implemented GfmLinebreak mode with comprehensive test coverage
-...
-                    total   04:41  (7 sessions)
+START  END    DUR    PROJECT  DESC
+-----------------------------------------------------------------------------------
+09:12  10:04  00:48  api      Add rate limiting middleware and integration tests
+10:20  11:35  01:11  webapp   Migrate user settings page to new component library
+13:30  14:02  00:31  scripts  Investigate slow nightly backup job
+-----------------------------------------------------------------------------------
+       total  02:30  (3 sessions)
 ```
 
 ## How it figures out engagement
@@ -38,9 +40,9 @@ that triggers Claude's own `away_summary`.
 Subagent logs (`.../subagents/...`) are skipped — they overlap with their
 parent session and would double-count time.
 
-## Session names
+## Session descriptions
 
-Names come from, in order of preference:
+The `DESC` column comes from, in order of preference:
 
 1. A Haiku-generated summary (cached at `~/.cache/wdid/titles-YYYY-MM-DD.json`).
    The summary is built from your prompts, the tool actions Claude took
